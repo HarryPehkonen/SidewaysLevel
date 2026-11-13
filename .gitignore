@@ -1,0 +1,7 @@
+# CodeBundler output, not source
+round_display.txt
+# local tooling
+.claude/
+*.bak
+*.orig
+build/
