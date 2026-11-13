@@ -51,10 +51,16 @@ sfe_lsm_data_t gyroData;
 bool imuInitialized = false;
 float accelX = 0.0f;  // X-axis acceleration for tilt display
 float accelY = 0.0f;  // Y-axis acceleration for tilt display
+float accelZ = 0.0f;  // Z-axis acceleration - needed to project the gyro onto gravity
 
 // Yaw tracking for Align mode
 float yawAngle = 0.0f;       // Integrated yaw angle from gyroscope
 float referenceYaw = 0.0f;   // Reference angle captured when user taps
+uint32_t referenceSetTime = 0;                  // when the reference was captured
+float refGx = 0.0f, refGy = 0.0f, refGz = 1.0f; // reference gravity vector (tilt comparison)
+float lastYawRate = 0.0f;                       // latest rotation rate, for the stillness gate
+float tiltDeltaDeg = 0.0f;                      // tilt-vector difference from the reference
+bool refCapturedMoving = false;                 // was the reference taken while moving?
 bool yawReferenceSet = false; // Whether reference has been captured
 uint32_t lastYawUpdate = 0;  // Last time yaw was updated
 
@@ -387,13 +393,33 @@ void loop() {
     const float alpha = 0.1f;  // Reduced from 0.2 for more smoothing
     accelX = alpha * (accelData.xData / 1000.0f) + (1.0f - alpha) * accelX;
     accelY = alpha * (accelData.yData / 1000.0f) + (1.0f - alpha) * accelY;
+    accelZ = alpha * (accelData.zData / 1000.0f) + (1.0f - alpha) * accelZ;
 
     // Integrate gyroscope Z-axis to track yaw rotation
     // Gyro data is in mdps (millidegrees per second), convert to dps
     uint32_t currentTime = millis();
     if (lastYawUpdate > 0) {
       float deltaTime = (currentTime - lastYawUpdate) / 1000.0f; // Convert to seconds
-      float yawRate = gyroData.zData / 1000.0f; // Convert mdps to dps
+      // Rotation about the GRAVITY axis, not the chip's Z axis: project the gyro vector onto the
+      // measured gravity vector. Integrating raw Z scales the result by cos(tilt) and leaks
+      // pitch/roll motion into the yaw - the main reason readings felt "confused".
+      float gMag = sqrtf(accelX * accelX + accelY * accelY + accelZ * accelZ);
+      float yawRate;
+      if (gMag > 0.5f) {
+        yawRate = (gyroData.xData * (accelX / gMag) + gyroData.yData * (accelY / gMag) +
+                   gyroData.zData * (accelZ / gMag)) / 1000.0f;
+      } else {
+        yawRate = gyroData.zData / 1000.0f;   // no usable gravity vector yet: fall back to Z
+      }
+      lastYawRate = yawRate;
+
+      // Zero-velocity update: while the device is essentially still the measured rate is bias, not
+      // rotation. Pull the estimate toward it slowly (~40 s at 120 Hz) so drift stops accumulating
+      // over a session. The 3 s calibration only has to get close.
+      if (!(displayMode == MODE_ALIGN && alignState == ALIGN_CALIBRATING) &&
+          fabsf(yawRate - gyroDriftRate) < 0.3f) {
+        gyroDriftRate += 2.0e-4f * (yawRate - gyroDriftRate);
+      }
 
       // Apply drift compensation (subtract measured bias)
       float compensatedRate = yawRate - gyroDriftRate;
@@ -402,6 +428,15 @@ void loop() {
       // Normalize to -180 to +180 range
       while (yawAngle > 180.0f) yawAngle -= 360.0f;
       while (yawAngle < -180.0f) yawAngle += 360.0f;
+
+      // Tilt-vector comparison: the angle between the stored reference gravity vector and the
+      // current one. Absolute and drift-free - this is the number to trust in Align mode.
+      if (gMag > 0.5f) {
+        float dot = (accelX / gMag) * refGx + (accelY / gMag) * refGy + (accelZ / gMag) * refGz;
+        if (dot > 1.0f) dot = 1.0f;
+        if (dot < -1.0f) dot = -1.0f;
+        tiltDeltaDeg = acosf(dot) * 180.0f / PI;
+      }
     }
     lastYawUpdate = currentTime;
 
@@ -646,11 +681,13 @@ static void renderAlign() {
 
   } else if (alignState == ALIGN_MEASURING) {
     // Measuring - show current angle and difference
+    // PRIMARY: tilt-vector difference - absolute, drift-free
     face.setTextColor(TFT_WHITE, CLOCK_BG);
     char angleStr[20];
-    snprintf(angleStr, sizeof(angleStr), "%.1f", yawAngle);
-    face.drawString(angleStr, CLOCK_R, CLOCK_R - 30);
-    face.drawString("deg", CLOCK_R, CLOCK_R - 5);
+    snprintf(angleStr, sizeof(angleStr), "%.1f", tiltDeltaDeg);
+    face.drawString(angleStr, CLOCK_R, CLOCK_R - 34);
+    face.setTextColor(TFT_DARKGREY, CLOCK_BG);
+    face.drawString("deg tilt", CLOCK_R, CLOCK_R - 8);
 
     // Calculate difference from reference
     float diff = yawAngle - referenceYaw;
@@ -659,15 +696,19 @@ static void renderAlign() {
     while (diff > 180.0f) diff -= 360.0f;
     while (diff < -180.0f) diff += 360.0f;
 
-    // Display difference
-    char diffStr[20];
-    snprintf(diffStr, sizeof(diffStr), "%c%.1f", diff >= 0 ? '+' : ' ', diff);
+    // SECONDARY: in-plane rotation, with its uncertainty band (drift x elapsed + floor)
+    float elapsedSec = (millis() - referenceSetTime) / 1000.0f;
+    float uncertainty = fabsf(gyroDriftRate) * elapsedSec + 0.3f;
+    char diffStr[24];
+    snprintf(diffStr, sizeof(diffStr), "%+0.1f +-%.1f", diff, uncertainty);
 
     // Color based on alignment
+    // Colour by the TOTAL error, not the bare delta: a confident wrong green is worse than none
     uint16_t diffColor;
-    if (fabs(diff) <= 2.0f) {
+    float totalErr = fabsf(diff) + uncertainty;
+    if (totalErr <= 2.0f) {
       diffColor = TFT_GREEN;   // Aligned
-    } else if (fabs(diff) <= 5.0f) {
+    } else if (totalErr <= 5.0f) {
       diffColor = TFT_YELLOW;  // Close
     } else {
       diffColor = TFT_RED;     // Misaligned
@@ -678,15 +719,16 @@ static void renderAlign() {
     face.drawString(diffStr, CLOCK_R, CLOCK_R + 50);
 
     // Visual indicator - show alignment status
-    if (fabs(diff) <= 2.0f) {
+    if (totalErr <= 2.0f) {
       face.setTextColor(TFT_GREEN, CLOCK_BG);
       face.drawString("ALIGNED", CLOCK_R, CLOCK_R + 80);
     }
 
     // Show drift compensation is active
     face.setTextColor(TFT_DARKGREY, CLOCK_BG);
-    char infoStr[30];
-    snprintf(infoStr, sizeof(infoStr), "drift comp: %.3f", gyroDriftRate);
+    char infoStr[40];
+    snprintf(infoStr, sizeof(infoStr), "drift %.3f%s", gyroDriftRate,
+             refCapturedMoving ? " REF MOVING" : "");
     face.drawString(infoStr, CLOCK_R, CLOCK_R + 100);
   }
 
@@ -864,12 +906,26 @@ void handleTouch(TouchZone zone) {
         } else if (alignState == ALIGN_WAIT_REFERENCE) {
           // Second tap: Set reference angle
           referenceYaw = yawAngle;
+          referenceSetTime = millis();
+          refCapturedMoving = (fabsf(lastYawRate) > 1.0f);
+          {
+            float gM = sqrtf(accelX * accelX + accelY * accelY + accelZ * accelZ);
+            if (gM > 0.5f) { refGx = accelX / gM; refGy = accelY / gM; refGz = accelZ / gM; }
+          }
+          if (refCapturedMoving) Serial.println("WARNING: reference captured while moving");
           yawReferenceSet = true;
           alignState = ALIGN_MEASURING;
           Serial.printf("Reference yaw captured: %.1f° (drift: %.3f°/s)\n", referenceYaw, gyroDriftRate);
         } else if (alignState == ALIGN_MEASURING) {
           // Subsequent taps: Reset reference
           referenceYaw = yawAngle;
+          referenceSetTime = millis();
+          refCapturedMoving = (fabsf(lastYawRate) > 1.0f);
+          {
+            float gM = sqrtf(accelX * accelX + accelY * accelY + accelZ * accelZ);
+            if (gM > 0.5f) { refGx = accelX / gM; refGy = accelY / gM; refGz = accelZ / gM; }
+          }
+          if (refCapturedMoving) Serial.println("WARNING: reference captured while moving");
           Serial.printf("Reference updated: %.1f°\n", referenceYaw);
         }
       }
